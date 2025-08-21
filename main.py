@@ -479,6 +479,23 @@ def set_preferences():
     PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
     PREF_FILE.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
     return jsonify({"status": "success"})
+@app.route("/debug_fs", methods=["GET"])
+def debug_fs():
+    import os
+    paths = [str(ROOT), str(MODEL_DIR), str(PIPELINE_PATH), str(ALT_PIPELINE_PATH)]
+    listing = {}
+    for p in paths:
+        try:
+            if os.path.isdir(p):
+                listing[p] = sorted([f"{name}  ({os.path.getsize(os.path.join(p,name))}B)" 
+                                     for name in os.listdir(p)])
+            elif os.path.isfile(p):
+                listing[p] = [f"<FILE> size={os.path.getsize(p)}B"]
+            else:
+                listing[p] = ["<MISSING>"]
+        except Exception as e:
+            listing[p] = [f"<ERROR> {e}"]
+    return jsonify({"cwd": os.getcwd(), "tree": listing})
 
 # -------- Premium UI (no f-string — placeholders replaced) --------
 @app.route("/", methods=["GET"])
