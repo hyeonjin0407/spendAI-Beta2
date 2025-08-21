@@ -1,16 +1,17 @@
 # main.py — SpendAI (Premium UI + API, single file)
 # - / : 고급 다크 테마 UI (반응형, 미니차트/토스트/탭/가이드)
-# - /health, /predict, /save_data, /get_preferences, /set_preferences
+# - /health, /predict, /save_data, /get_preferences, /set_preferences, /debug_fs
 # - 모델 자동 로드 (xgb_ensemble -> pipeline -> dict{'pipeline'|'model'+'preproc'} -> model_only -> heuristic)
-# - 휴리스틱은 성향(user_type)·사유(reason)·카테고리(category) 정렬/페널티 적용
+# - 예측 안정화: NaN/범위 방어, 제품명 공백 기본 토큰
 # - CSV 저장 5컬럼 고정: 금액(원),제품명,당시 기분,후회 여부,구매 이유
 # - 데이터 경로: Windows 로컬 강제(기본) 또는 프로젝트 상대(spendAI/xpend/data)
+# - 런타임 백업 다운로드(gdown): MODEL_GDRIVE_URL 환경변수로 구글드라이브에서 모델 내려받기
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from pathlib import Path
 from datetime import datetime
-import json, csv, os, math, traceback, sys
+import json, csv, os, math, traceback, sys, subprocess
 
 # ML
 try:
@@ -68,7 +69,7 @@ model_loaded = False
 model_mode = "heuristic"  # "xgb_ensemble" | "pipeline" | "model+preproc" | "model_only" | "heuristic"
 
 def _log(msg: str):
-    print(f"[SpendAI] {msg}", flush=True)
+    print("[SpendAI] " + str(msg), flush=True)
 
 # -------- Utils --------
 def _sigmoid(x: float) -> float:
@@ -132,10 +133,6 @@ def _extract_proba_one(proba_row) -> float:
 # -------- Heuristic Model --------
 REASONS_IMPULSIVE = {"즉흥 구매", "스트레스 해소용", "온라인 광고 보고"}
 REASONS_PLANNED   = {"필요", "계획된 지출", "기념일 선물로"}
-REASONS_SOCIAL    = {"친구 추천으로"}
-REASONS_PRICE     = {"가격이 좋아서"}
-REASONS_WISHLIST  = {"평소에 사고 싶었음", "새로운 취미 시작해서"}
-
 CATS_UP   = {"전자제품", "전자기기", "의류", "가전"}
 CATS_DOWN = {"식료품", "생활용품"}
 
@@ -215,6 +212,8 @@ def _row_from_payload(payload: dict):
     dow_ko  = str(payload.get("요일","") or "")
     feeling_num = int(payload.get("당시 기분", 3) or 3)
     product = str(payload.get("제품명", "") or "")
+    if not product.strip():
+        product = "상품"  # 텍스트 피처 기본 토큰
 
     row = {
         "amount": amount,
@@ -225,7 +224,6 @@ def _row_from_payload(payload: dict):
         "dow":      dow_map.get(dow_ko, 0),
         "product":  product,
     }
-    # amount_log
     if np is not None:
         row["amount_log"] = float(np.log1p(max(0.0, row["amount"])))
     else:
@@ -242,6 +240,15 @@ def _try_load_models():
             _log("joblib not available, skip model load (heuristic).")
             return
 
+        # 최우선: 파일이 없으면 런타임 백업 다운로드(gdown) 시도 (환경변수 필요)
+        if (not PIPELINE_PATH.exists()) and os.environ.get("MODEL_GDRIVE_URL"):
+            try:
+                _log("Pipeline not found; trying runtime gdown via MODEL_GDRIVE_URL ...")
+                subprocess.check_call(["gdown", "--fuzzy", os.environ["MODEL_GDRIVE_URL"], "-O", str(PIPELINE_PATH)])
+                _log("Runtime gdown success.")
+            except Exception as e:
+                _log("Runtime gdown failed: " + str(e))
+
         # 우선순위: model/spendai_pipeline.pkl -> ./spendai_pipeline.pkl
         path = PIPELINE_PATH if PIPELINE_PATH.exists() else (ALT_PIPELINE_PATH if ALT_PIPELINE_PATH.exists() else None)
         if path is not None:
@@ -257,7 +264,7 @@ def _try_load_models():
                         ensemble_bundle = obj
                         model_loaded = True
                         model_mode = "xgb_ensemble"
-                        _log(f"Loaded XGB ensemble bundle: {path} (folds={len(fs)})")
+                        _log("Loaded XGB ensemble bundle: " + str(path) + " (folds=" + str(len(fs)) + ")")
                         return  # 가장 우선
 
             # 2) dict로 저장된 (pipeline) 또는 (model+preproc)
@@ -267,13 +274,13 @@ def _try_load_models():
                     pipeline = cand
                     model_loaded = True
                     model_mode = "pipeline"
-                    _log(f"Loaded pipeline from dict key: {path}")
+                    _log("Loaded pipeline from dict key: " + str(path))
                     return
                 elif "preproc" in obj and "model" in obj and hasattr(obj["model"], "predict"):
                     preproc = obj["preproc"]; model = obj["model"]
                     model_loaded = True
                     model_mode = "model+preproc"
-                    _log(f"Loaded model+preproc from dict: {path}")
+                    _log("Loaded model+preproc from dict: " + str(path))
                     return
                 else:
                     _log("Dict loaded but no usable estimator found; continue to explicit files...")
@@ -283,7 +290,7 @@ def _try_load_models():
                     pipeline = obj
                     model_loaded = True
                     model_mode = "pipeline"
-                    _log(f"Loaded pipeline object: {path}")
+                    _log("Loaded pipeline object: " + str(path))
                     return
                 else:
                     _log("Object at PIPELINE_PATH has no predict(); continue...")
@@ -295,23 +302,21 @@ def _try_load_models():
                 if PREPROC_PATH.exists():
                     preproc = joblib.load(PREPROC_PATH)
                     model_mode = "model+preproc"
-                    _log(f"Loaded model+preproc: {MODEL_PATH}, {PREPROC_PATH}")
+                    _log("Loaded model+preproc: " + str(MODEL_PATH) + ", " + str(PREPROC_PATH))
                 else:
                     model_mode = "model_only"
-                    _log(f"Loaded model only: {MODEL_PATH}")
+                    _log("Loaded model only: " + str(MODEL_PATH))
                 model_loaded = True
                 return
             except Exception as e:
-                _log(f"Explicit model load failed: {e}\n{traceback.format_exc()}")
+                _log("Explicit model load failed: " + str(e) + "\n" + traceback.format_exc())
 
         # 5) 모두 실패 → heuristic
         _log("No usable model found. Using heuristic fallback.")
     except Exception as e:
-        _log(f"Model load failed: {e}\n{traceback.format_exc()}")
+        _log("Model load failed: " + str(e) + "\n" + traceback.format_exc())
         pipeline = None; model = None; preproc = None; ensemble_bundle = None
         model_loaded = False; model_mode = "heuristic"
-
-_try_load_models()
 
 # -------- Ensemble predict --------
 def _predict_with_ensemble(payload: dict) -> float:
@@ -320,7 +325,7 @@ def _predict_with_ensemble(payload: dict) -> float:
     try:
         df = _row_from_payload(payload)  # pandas DF 1행
         preds = []
-        for f in ensemble_bundle["folds"]:
+        for f in ensemble_bundle.get("folds", []):
             pre_catnum = f["pre_catnum"]
             tfidf_word = f["tfidf_word"]
             tfidf_char = f["tfidf_char"]
@@ -334,15 +339,20 @@ def _predict_with_ensemble(payload: dict) -> float:
 
             dmat = xgb.DMatrix(Xmat)
             proba = booster.predict(dmat, iteration_range=(0, best_iter+1))
-            p = float(proba[0] if np is None else float(proba[0]))
-            preds.append(p)
+            val = float(proba[0])
+            # 안정화: NaN/범위 방어
+            if not (0.0 <= val <= 1.0) or (val != val):
+                val = 0.5
+            preds.append(val)
 
         if not preds:
             return _heuristic_regret(payload)
         p = float(sum(preds) / len(preds))
+        if not (0.0 <= p <= 1.0) or (p != p):
+            p = 0.5
         return max(0.0, min(1.0, p))
     except Exception as e:
-        _log(f"Ensemble predict failed: {e}\n{traceback.format_exc()} — fallback heuristic.")
+        _log("Ensemble predict failed: " + str(e) + "\n" + traceback.format_exc() + " — fallback heuristic.")
         return _heuristic_regret(payload)
 
 # -------- Prediction --------
@@ -403,7 +413,7 @@ def _predict_with_model(payload: dict) -> float:
                     p = _as_float(y[0], 0.0)
                 return max(0.0, min(1.0, p))
     except Exception as e:
-        _log(f"Predict failed with model: {e}\n{traceback.format_exc()} — fallback to heuristic.")
+        _log("Predict failed with model: " + str(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
 
     return _heuristic_regret(payload)
 
@@ -423,6 +433,12 @@ def health():
         "model_loaded": bool(model_loaded),
         "mode": model_mode,
         "data_path": str(DATA_FILE),
+        "pipeline_path": str(PIPELINE_PATH),
+        "alt_pipeline_path": str(ALT_PIPELINE_PATH),
+        "pipeline_path_exists": PIPELINE_PATH.exists(),
+        "alt_pipeline_path_exists": ALT_PIPELINE_PATH.exists(),
+        "model_path_exists": MODEL_PATH.exists(),
+        "preproc_path_exists": PREPROC_PATH.exists(),
         "py": sys.version.split(" ")[0],
         "numpy": getattr(np, "__version__", None),
         "pandas": getattr(pd, "__version__", None),
@@ -431,13 +447,35 @@ def health():
         "now": datetime.now().isoformat(timespec="seconds"),
     })
 
+@app.route("/debug_fs", methods=["GET"])
+def debug_fs():
+    paths = [
+        str(ROOT),
+        str(MODEL_DIR),
+        str(PIPELINE_PATH),
+        str(ALT_PIPELINE_PATH),
+    ]
+    listing = {}
+    for p in paths:
+        try:
+            if os.path.isdir(p):
+                listing[p] = sorted([name + "  (" + str(os.path.getsize(os.path.join(p, name))) + "B)"
+                                     for name in os.listdir(p)])
+            elif os.path.isfile(p):
+                listing[p] = ["<FILE> size=" + str(os.path.getsize(p)) + "B"]
+            else:
+                listing[p] = ["<MISSING>"]
+        except Exception as e:
+            listing[p] = ["<ERROR> " + str(e)]
+    return jsonify({"cwd": os.getcwd(), "tree": listing})
+
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.get_json(force=True, silent=True) or {}
     required = ['금액(원)', '당시 기분', '항목', '구매 이유', '요일', '월', 'user_type']
     missing = [k for k in required if k not in data]
     if missing:
-        return jsonify({'error': f"Missing field(s): {', '.join(missing)}"}), 400
+        return jsonify({'error': "Missing field(s): " + ", ".join(missing)}), 400
     p = _predict_with_model(data)
     return jsonify({
         "regret_probability": float(max(0.0, min(1.0, p))),
@@ -454,7 +492,7 @@ def save_data():
     fieldnames = ['금액(원)', '제품명', '당시 기분', '후회 여부', '구매 이유']
     missing = [k for k in fieldnames if k not in data]
     if missing:
-        return jsonify({'error': f"Missing field(s): {', '.join(missing)}"}), 400
+        return jsonify({'error': "Missing field(s): " + ", ".join(missing)}), 400
 
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     is_new = not DATA_FILE.exists()
@@ -479,23 +517,6 @@ def set_preferences():
     PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
     PREF_FILE.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
     return jsonify({"status": "success"})
-@app.route("/debug_fs", methods=["GET"])
-def debug_fs():
-    import os
-    paths = [str(ROOT), str(MODEL_DIR), str(PIPELINE_PATH), str(ALT_PIPELINE_PATH)]
-    listing = {}
-    for p in paths:
-        try:
-            if os.path.isdir(p):
-                listing[p] = sorted([f"{name}  ({os.path.getsize(os.path.join(p,name))}B)" 
-                                     for name in os.listdir(p)])
-            elif os.path.isfile(p):
-                listing[p] = [f"<FILE> size={os.path.getsize(p)}B"]
-            else:
-                listing[p] = ["<MISSING>"]
-        except Exception as e:
-            listing[p] = [f"<ERROR> {e}"]
-    return jsonify({"cwd": os.getcwd(), "tree": listing})
 
 # -------- Premium UI (no f-string — placeholders replaced) --------
 @app.route("/", methods=["GET"])
@@ -778,7 +799,6 @@ async function predict(){
     "요일": document.querySelector("#day").value,
     "월": Number(document.querySelector("#month").value||1),
     "user_type": document.querySelector("#userType").value,
-    // 제품명은 UI 예측 입력엔 없지만, 앙상블 텍스트 피처용으로 사용할 수 있어
     "제품명": document.querySelector("#s_product") ? (document.querySelector("#s_product").value||"") : ""
   };
   const r = await fetchJSON('/predict', { method:'POST', body: JSON.stringify(payload) });
@@ -787,12 +807,12 @@ async function predict(){
   if(r.ok){
     const p = Number(r.json.regret_probability||0);
     const ut = r.json.user_type||payload.user_type;
-    el.textContent = `후회 확률: ${(p*100).toFixed(2)}%  (유형: ${ut})`;
-    hint.textContent = r.json.note ? `mode: ${r.json.note}` : '';
+    el.textContent = "후회 확률: " + (p*100).toFixed(2) + "%  (유형: " + ut + ")";
+    hint.textContent = r.json.note ? ("mode: " + r.json.note) : '';
     hist.push(p); if(hist.length>24) hist = hist.slice(-24);
     setGauge(p); drawSpark(); toast("예측 완료");
   } else {
-    el.textContent = `오류(${r.code}): ${JSON.stringify(r.json)}`;
+    el.textContent = "오류(" + r.code + "): " + JSON.stringify(r.json);
   }
 }
 
@@ -808,8 +828,8 @@ async function saveData(){
   };
   const r = await fetchJSON('/save_data', { method:'POST', body: JSON.stringify(payload) });
   const el = document.querySelector("#resultSave");
-  if(r.ok){ el.textContent = `저장 성공 ✅ (${r.json.path})`; toast("저장 완료"); }
-  else { el.textContent = `실패(${r.code}): ${JSON.stringify(r.json)}`; }
+  if(r.ok){ el.textContent = "저장 성공 ✅ (" + r.json.path + ")"; toast("저장 완료"); }
+  else { el.textContent = "실패(" + r.code + "): " + JSON.stringify(r.json); }
 }
 
 // 초기 상태 로딩
@@ -817,8 +837,8 @@ async function saveData(){
   try{
     const r = await fetchJSON('/health');
     if(r.ok&&r.json){
-      document.querySelector("#modeChip").textContent = `mode: ${r.json.mode} (loaded=${r.json.model_loaded})`;
-      document.querySelector("#stateMode").textContent = `${r.json.mode}, loaded=${r.json.model_loaded}`;
+      document.querySelector("#modeChip").textContent = "mode: " + r.json.mode + " (loaded=" + r.json.model_loaded + ")";
+      document.querySelector("#stateMode").textContent = r.json.mode + ", loaded=" + r.json.model_loaded;
       document.querySelector("#stateRaw").textContent = JSON.stringify(r.json, null, 2);
       hist = Array.from({length:12},()=>Math.max(0,Math.min(1, (Math.random()*0.5)+0.25 )));
       setGauge(hist[hist.length-1]||0); drawSpark();
@@ -839,5 +859,7 @@ async function saveData(){
     return resp
 
 if __name__ == "__main__":
+    # 서버 시작 전에 모델 로드 시도
+    _try_load_models()
     port = int(os.environ.get("PORT", 61006))
     app.run(host="0.0.0.0", port=port)
