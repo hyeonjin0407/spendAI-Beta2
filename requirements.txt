@@ -7,3 +7,4 @@ scikit-learn==1.7.1
 joblib==1.4.2
 xgboost==2.0.3
 scipy==1.11.4
+gdown
