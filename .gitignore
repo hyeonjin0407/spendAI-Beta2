@@ -1,0 +1,26 @@
+# Python bytecode / cache
+__pycache__/
+*.pyc
+
+# Virtual envs
+.venv/
+venv/
+env/
+xpend/
+Lib/
+Scripts/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Data & models (큰 파일은 repo에 넣지 말기)
+spendAI/xpend/data/
+model/*.pkl
+*.pkl
+*.joblib
+
+# Node/Flutter 등(혹시 있을 경우)
+node_modules/
+build/
+!model/spendai_pipeline.pkl
