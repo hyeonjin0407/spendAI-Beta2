@@ -383,47 +383,67 @@ def _predict_with_ensemble(payload: dict) -> float:
 # -------- Prediction dispatcher --------
 def _predict_with_ensemble(payload: dict) -> float:
     """
-    XGB 앙상블 예측.
-    - 일부 환경에서 best_iter/iteration_range가 0/None로 들어오면 1.0 고정되는 현상 회피
-    - 항상 '전체 트리' 예측을 기본으로, best_iter가 유효하면 보조로 섞어 평균
+    XGB 앙상블 예측(안전판):
+    - 폴드 항목이 dict/객체/네임드튜플 어떤 형태든 getattr/키 접근 모두 지원
+    - iteration_range는 best_iter 유효할 때만 시도, 기본은 전체 트리 예측
+    - 폴드 하나라도 실패하면 그 폴드는 건너뛰고 평균, 전부 실패면 heuristic
     """
     if ensemble_bundle is None or xgb is None or sp is None:
         return _heuristic_regret(payload)
+
+    def _fget(o, name, default=None):
+        # dict 또는 객체 속성 모두 지원
+        if isinstance(o, dict):
+            return o.get(name, default)
+        return getattr(o, name, default)
+
     try:
         df = _row_from_payload(payload)
         preds = []
-        for f in ensemble_bundle.get("folds", []):
-            pre_catnum = f["pre_catnum"]
-            tfidf_word = f["tfidf_word"]
-            tfidf_char = f["tfidf_char"]
-            booster    = f["booster"]
-            best_iter  = f.get("best_iter", None)
+        folds = ensemble_bundle.get("folds") if isinstance(ensemble_bundle, dict) else getattr(ensemble_bundle, "folds", None)
+        if not folds:
+            return _heuristic_regret(payload)
 
-            # 입력 변환
-            M_cn = pre_catnum.transform(df)
-            M_w  = tfidf_word.transform(df["product"])
-            M_c  = tfidf_char.transform(df["product"])
-            Xmat = sp.hstack([M_cn, M_w, M_c], format="csr")
-            dmat = xgb.DMatrix(Xmat)
-
-            # 1) 전체 트리 예측(항상 가능)
-            p_full = float(booster.predict(dmat)[0])
-
-            # 2) best_iter가 유효하면 그 범위로도 예측 시도
-            p_best = None
+        for f in folds:
             try:
-                if isinstance(best_iter, int) and best_iter >= 0:
-                    p_best = float(booster.predict(dmat, iteration_range=(0, best_iter + 1))[0])
-            except Exception:
+                pre_catnum = _fget(f, "pre_catnum")
+                tfidf_word = _fget(f, "tfidf_word")
+                tfidf_char = _fget(f, "tfidf_char")
+                booster    = _fget(f, "booster")
+                best_iter  = _fget(f, "best_iter", None)
+
+                if pre_catnum is None or tfidf_word is None or tfidf_char is None or booster is None:
+                    # 구조가 예상과 다르면 이 폴드는 스킵
+                    continue
+
+                # 입력 변환
+                M_cn = pre_catnum.transform(df)
+                M_w  = tfidf_word.transform(df["product"])
+                M_c  = tfidf_char.transform(df["product"])
+                Xmat = sp.hstack([M_cn, M_w, M_c], format="csr")
+                dmat = xgb.DMatrix(Xmat)
+
+                # 1) 전체 트리 예측(항상 가능)
+                p_full = float(booster.predict(dmat)[0])
+
+                # 2) best_iter 유효하면 최적 반복 예측도 시도 (버전따라 예외 나면 무시)
                 p_best = None
+                try:
+                    if isinstance(best_iter, int) and best_iter >= 0:
+                        p_best = float(booster.predict(dmat, iteration_range=(0, best_iter + 1))[0])
+                except Exception:
+                    p_best = None
 
-            # 사용값: p_best 유효하면 평균, 아니면 p_full
-            val = p_full if (p_best is None) else ((p_full + p_best) / 2.0)
+                # 사용값: p_best 있으면 평균, 없으면 p_full
+                val = p_full if (p_best is None) else ((p_full + p_best) / 2.0)
 
-            # NaN/범위 방어
-            if not (0.0 <= val <= 1.0) or (val != val):
-                val = 0.5
-            preds.append(val)
+                # NaN/범위 방어
+                if not (0.0 <= val <= 1.0) or (val != val):
+                    val = 0.5
+                preds.append(val)
+            except Exception:
+                # 개별 폴드 실패는 전체 실패로 보지 않음
+                continue
 
         if not preds:
             return _heuristic_regret(payload)
@@ -432,8 +452,7 @@ def _predict_with_ensemble(payload: dict) -> float:
         if not (0.0 <= p <= 1.0) or (p != p):
             p = 0.5
         return max(0.001, min(0.999, p))
-    except Exception as e:
-        _log("Ensemble predict failed: " + repr(e) + "\n" + traceback.format_exc() + " — fallback heuristic.")
+    except Exception:
         return _heuristic_regret(payload)
 
 # -------- APIs --------
