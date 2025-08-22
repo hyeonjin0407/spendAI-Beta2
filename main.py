@@ -345,43 +345,6 @@ _try_load_models()
 
 # -------- Ensemble predict --------
 def _predict_with_ensemble(payload: dict) -> float:
-    if ensemble_bundle is None or xgb is None or sp is None:
-        return _heuristic_regret(payload)
-    try:
-        df = _row_from_payload(payload)  # pandas DF 1행
-        preds = []
-        for f in ensemble_bundle.get("folds", []):
-            pre_catnum = f["pre_catnum"]
-            tfidf_word = f["tfidf_word"]
-            tfidf_char = f["tfidf_char"]
-            booster    = f["booster"]
-            best_iter  = int(f.get("best_iter", 0))
-
-            M_cn = pre_catnum.transform(df)
-            M_w  = tfidf_word.transform(df["product"])
-            M_c  = tfidf_char.transform(df["product"])
-            Xmat = sp.hstack([M_cn, M_w, M_c], format="csr")
-
-            dmat = xgb.DMatrix(Xmat)
-            proba = booster.predict(dmat, iteration_range=(0, best_iter+1))
-            val = float(proba[0])
-            # 안정화: NaN/범위 방어
-            if not (0.0 <= val <= 1.0) or (val != val):
-                val = 0.5
-            preds.append(val)
-
-        if not preds:
-            return _heuristic_regret(payload)
-        p = float(sum(preds) / len(preds))
-        if not (0.0 <= p <= 1.0) or (p != p):
-            p = 0.5
-        return max(0.0, min(1.0, p))
-    except Exception as e:
-        _log("Ensemble predict failed: " + repr(e) + "\n" + traceback.format_exc() + " — fallback heuristic.")
-        return _heuristic_regret(payload)
-
-# -------- Prediction dispatcher --------
-def _predict_with_ensemble(payload: dict) -> float:
     """
     XGB 앙상블 예측(안전판):
     - 폴드 항목이 dict/객체/네임드튜플 어떤 형태든 getattr/키 접근 모두 지원
@@ -454,6 +417,68 @@ def _predict_with_ensemble(payload: dict) -> float:
         return max(0.001, min(0.999, p))
     except Exception:
         return _heuristic_regret(payload)
+
+# -------- Prediction dispatcher --------
+def _predict_with_model(payload: dict) -> float:
+    # 0) ensemble 우선
+    if model_mode == "xgb_ensemble":
+        return _predict_with_ensemble(payload)
+
+    try:
+        if model_loaded and pd is not None:
+            # 1) pipeline 모드
+            if model_mode == "pipeline" and pipeline is not None:
+                df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
+                if hasattr(pipeline, "predict_proba"):
+                    proba = pipeline.predict_proba(df)
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = pipeline.predict(df)
+                    p = _as_float(y[0], 0.0)
+                return max(0.0, min(1.0, p))
+
+            # 2) model+preproc 모드
+            if model_mode == "model+preproc" and model is not None and preproc is not None:
+                df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
+                X = preproc.transform(df)
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(X)
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = model.predict(X)
+                    p = _as_float(y[0], 0.0)
+                return max(0.0, min(1.0, p))
+
+            # 3) model_only (간소화)
+            if model_mode == "model_only" and model is not None and np is not None:
+                cats = {"전자제품": 1, "전자기기": 1, "의류": 1, "가전": 1, "식료품": -1, "생활용품": -1}
+                reasons = {
+                    "즉흥 구매": 1, "스트레스 해소용": 1, "온라인 광고 보고": 1,
+                    "필요": -1, "계획된 지출": -1, "기념일 선물로": -1
+                }
+                days = {"금요일": 1, "토요일": 1}
+                price = _as_float(payload.get("금액(원)", 0), 0)
+                mood  = _as_float(payload.get("당시 기분", 3), 3)
+                month = int(payload.get("월", 1) or 1)
+                c = cats.get(str(payload.get("항목","") or ""), 0)
+                r = reasons.get(str(payload.get("구매 이유","") or ""), 0)
+                d = days.get(str(payload.get("요일","") or ""), 0)
+                u = 1 if str(payload.get("user_type","") or "") in {"hobby_spender","electronics_lover"} else (-1 if str(payload.get("user_type","") or "")=="planned_spending" else 0)
+                Xa = np.array([[price, mood, month, c, r, d, u]], dtype=float)
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(Xa)
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = model.predict(Xa)
+                    p = _as_float(y[0], 0.0)
+                return max(0.0, min(1.0, p))
+    except Exception as e:
+        _log("Predict failed with model: " + repr(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
+
+    return _heuristic_regret(payload)
 
 # -------- APIs --------
 @app.after_request
