@@ -1,11 +1,10 @@
 # main.py — SpendAI (Premium UI + API, single file)
-# - / : 고급 다크 테마 UI (반응형, 미니차트/토스트/탭/가이드)
-# - /health, /predict, /save_data, /get_preferences, /set_preferences, /debug_fs
-# - 모델 자동 로드 (xgb_ensemble -> pipeline -> dict{'pipeline'|'model'+'preproc'} -> model_only -> heuristic)
+# - / : 다크 프리미엄 UI
+# - /health, /predict, /save_data, /get_preferences, /set_preferences, /debug_fs, /debug_predict
+# - 모델 자동 로드: xgb_ensemble -> pipeline -> (model+preproc) -> model_only -> heuristic
 # - 예측 안정화: NaN/범위 방어, 제품명 공백 기본 토큰
-# - CSV 저장 5컬럼 고정: 금액(원),제품명,당시 기분,후회 여부,구매 이유
-# - 데이터 경로: Windows 로컬 강제(기본) 또는 프로젝트 상대(spendAI/xpend/data)
-# - 런타임 백업 다운로드(gdown): MODEL_GDRIVE_URL 환경변수로 구글드라이브에서 모델 내려받기
+# - Windows 로컬 CSV 강제 저장(기본) 또는 프로젝트 상대 경로
+# - 런타임 백업 다운로드(gdown) 지원: MODEL_GDRIVE_URL 환경변수
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -56,7 +55,7 @@ else:
 
 MODEL_DIR = ROOT / "model"
 PIPELINE_PATH = MODEL_DIR / "spendai_pipeline.pkl"
-ALT_PIPELINE_PATH = ROOT / "spendai_pipeline.pkl"  # 루트에 저장된 경우도 허용
+ALT_PIPELINE_PATH = ROOT / "spendai_pipeline.pkl"  # 루트에 있을 수도 있음
 MODEL_PATH    = MODEL_DIR / "spendai_model.pkl"
 PREPROC_PATH  = MODEL_DIR / "spendai_preprocessor.pkl"
 
@@ -240,83 +239,109 @@ def _try_load_models():
             _log("joblib not available, skip model load (heuristic).")
             return
 
-        # 최우선: 파일이 없으면 런타임 백업 다운로드(gdown) 시도 (환경변수 필요)
+        # 필요 시 런타임 다운로드 (환경변수)
         if (not PIPELINE_PATH.exists()) and os.environ.get("MODEL_GDRIVE_URL"):
             try:
                 _log("Pipeline not found; trying runtime gdown via MODEL_GDRIVE_URL ...")
                 subprocess.check_call(["gdown", "--fuzzy", os.environ["MODEL_GDRIVE_URL"], "-O", str(PIPELINE_PATH)])
                 _log("Runtime gdown success.")
             except Exception as e:
-                _log("Runtime gdown failed: " + str(e))
+                _log("Runtime gdown failed: " + repr(e))
 
-        # 우선순위: model/spendai_pipeline.pkl -> ./spendai_pipeline.pkl
+        # 탐색 경로
         path = PIPELINE_PATH if PIPELINE_PATH.exists() else (ALT_PIPELINE_PATH if ALT_PIPELINE_PATH.exists() else None)
-        if path is not None:
-            obj = joblib.load(path)
+        if path is None:
+            _log("No pipeline file found at known paths.")
+        else:
+            _log(f"Loading pipeline object from: {path}")
+            try:
+                obj = joblib.load(path)
+                _log(f"Loaded object type: {type(obj)}")
+            except Exception as e:
+                _log("joblib.load failed: " + repr(e) + "\n" + traceback.format_exc())
+                obj = None
 
-            # 1) XGB 앙상블 번들(dict) 지원
-            if isinstance(obj, dict) and "folds" in obj:
-                if xgb is None or sp is None:
-                    _log("xgboost/scipy not installed; cannot use ensemble bundle. Fallback to others.")
-                else:
-                    fs = obj.get("folds") or []
-                    if fs and all(k in fs[0] for k in ["pre_catnum","tfidf_word","tfidf_char","booster"]):
-                        ensemble_bundle = obj
-                        model_loaded = True
-                        model_mode = "xgb_ensemble"
-                        _log("Loaded XGB ensemble bundle: " + str(path) + " (folds=" + str(len(fs)) + ")")
-                        return  # 가장 우선
+            if obj is not None:
+                try:
+                    # 1) XGB 앙상블 번들(dict)
+                    if isinstance(obj, dict) and ("folds" in obj or "threshold" in obj):
+                        _log("Detected dict bundle keys: " + ", ".join(list(obj.keys())[:12]))
+                        if xgb is None or sp is None:
+                            _log("xgboost/scipy missing, cannot use ensemble bundle.")
+                        else:
+                            folds = obj.get("folds") or []
+                            ok = False
+                            if folds:
+                                f0 = folds[0]
+                                if isinstance(f0, dict):
+                                    ok = all(k in f0 for k in ["pre_catnum", "tfidf_word", "tfidf_char", "booster"])
+                                else:
+                                    ok = all(hasattr(f0, k) for k in ["pre_catnum", "tfidf_word", "tfidf_char", "booster"])
+                            if ok:
+                                ensemble_bundle = obj
+                                model_loaded = True
+                                model_mode = "xgb_ensemble"
+                                _log(f"XGB ensemble bundle ready. folds={len(folds)}, threshold={obj.get('threshold')}")
+                                return
+                            else:
+                                _log("Dict bundle present but unexpected fold structure; skipping ensemble use.")
 
-            # 2) dict로 저장된 (pipeline) 또는 (model+preproc)
-            if isinstance(obj, dict):
-                cand = obj.get("pipeline") or obj.get("estimator") or obj.get("model")
-                if cand is not None and hasattr(cand, "predict"):
-                    pipeline = cand
-                    model_loaded = True
-                    model_mode = "pipeline"
-                    _log("Loaded pipeline from dict key: " + str(path))
-                    return
-                elif "preproc" in obj and "model" in obj and hasattr(obj["model"], "predict"):
-                    preproc = obj["preproc"]; model = obj["model"]
-                    model_loaded = True
-                    model_mode = "model+preproc"
-                    _log("Loaded model+preproc from dict: " + str(path))
-                    return
-                else:
-                    _log("Dict loaded but no usable estimator found; continue to explicit files...")
-            else:
-                # 3) 객체가 estimator면 pipeline 모드
-                if hasattr(obj, "predict"):
-                    pipeline = obj
-                    model_loaded = True
-                    model_mode = "pipeline"
-                    _log("Loaded pipeline object: " + str(path))
-                    return
-                else:
-                    _log("Object at PIPELINE_PATH has no predict(); continue...")
+                    # 2) dict 안에 pipeline/estimator 또는 model+preproc
+                    if isinstance(obj, dict):
+                        for key in ["pipeline", "estimator", "clf", "model"]:
+                            cand = obj.get(key)
+                            if cand is not None and hasattr(cand, "predict"):
+                                pipeline = cand
+                                model_loaded = True
+                                model_mode = "pipeline"
+                                _log(f"Using estimator from dict key '{key}'.")
+                                return
+                        pre = obj.get("preproc") or obj.get("preprocessor")
+                        mdl = obj.get("model") or obj.get("estimator")
+                        if pre is not None and mdl is not None and hasattr(mdl, "predict"):
+                            preproc = pre; model = mdl
+                            model_loaded = True
+                            model_mode = "model+preproc"
+                            _log("Using dict{preproc + model}.")
+                            return
+                        _log("Dict loaded but no usable estimator/preproc combo.")
+                    else:
+                        # 3) 바로 estimator/pipeline 객체
+                        if hasattr(obj, "predict"):
+                            pipeline = obj
+                            model_loaded = True
+                            model_mode = "pipeline"
+                            _log("Using direct pipeline/estimator object.")
+                            return
 
-        # 4) 명시적 모델/전처리자 경로
+                    _log("No usable model detected in loaded object; will try explicit files if present.")
+                except Exception as e:
+                    _log("Post-load inspection failed: " + repr(e) + "\n" + traceback.format_exc())
+
+        # 4) 명시적 경로 (model_only / model+preproc)
         if MODEL_PATH.exists():
             try:
                 model = joblib.load(MODEL_PATH)
                 if PREPROC_PATH.exists():
                     preproc = joblib.load(PREPROC_PATH)
                     model_mode = "model+preproc"
-                    _log("Loaded model+preproc: " + str(MODEL_PATH) + ", " + str(PREPROC_PATH))
+                    _log("Loaded model+preproc from explicit paths.")
                 else:
                     model_mode = "model_only"
-                    _log("Loaded model only: " + str(MODEL_PATH))
+                    _log("Loaded model only from explicit path.")
                 model_loaded = True
                 return
             except Exception as e:
-                _log("Explicit model load failed: " + str(e) + "\n" + traceback.format_exc())
+                _log("Explicit model load failed: " + repr(e) + "\n" + traceback.format_exc())
 
-        # 5) 모두 실패 → heuristic
         _log("No usable model found. Using heuristic fallback.")
     except Exception as e:
-        _log("Model load failed: " + str(e) + "\n" + traceback.format_exc())
+        _log("Model load failed (outer): " + repr(e) + "\n" + traceback.format_exc())
         pipeline = None; model = None; preproc = None; ensemble_bundle = None
         model_loaded = False; model_mode = "heuristic"
+
+# ----- import 시점에 모델 로드 (gunicorn에서도 동작) -----
+_try_load_models()
 
 # -------- Ensemble predict --------
 def _predict_with_ensemble(payload: dict) -> float:
@@ -352,10 +377,10 @@ def _predict_with_ensemble(payload: dict) -> float:
             p = 0.5
         return max(0.0, min(1.0, p))
     except Exception as e:
-        _log("Ensemble predict failed: " + str(e) + "\n" + traceback.format_exc() + " — fallback heuristic.")
+        _log("Ensemble predict failed: " + repr(e) + "\n" + traceback.format_exc() + " — fallback heuristic.")
         return _heuristic_regret(payload)
 
-# -------- Prediction --------
+# -------- Prediction dispatcher --------
 def _predict_with_model(payload: dict) -> float:
     # 0) ensemble 우선
     if model_mode == "xgb_ensemble":
@@ -388,7 +413,7 @@ def _predict_with_model(payload: dict) -> float:
                     p = _as_float(y[0], 0.0)
                 return max(0.0, min(1.0, p))
 
-            # 3) model_only (간소화 임베딩)
+            # 3) model_only (간소화)
             if model_mode == "model_only" and model is not None and np is not None:
                 cats = {"전자제품": 1, "전자기기": 1, "의류": 1, "가전": 1, "식료품": -1, "생활용품": -1}
                 reasons = {
@@ -413,14 +438,14 @@ def _predict_with_model(payload: dict) -> float:
                     p = _as_float(y[0], 0.0)
                 return max(0.0, min(1.0, p))
     except Exception as e:
-        _log("Predict failed with model: " + str(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
+        _log("Predict failed with model: " + repr(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
 
     return _heuristic_regret(payload)
 
 # -------- APIs --------
 @app.after_request
 def add_no_cache_headers(resp):
-    # 캐시로 UI가 안바뀌는 현상 방지
+    # 캐시로 UI 업데이트 안 되는 현상 방지
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
@@ -434,8 +459,8 @@ def health():
         "mode": model_mode,
         "data_path": str(DATA_FILE),
         "pipeline_path": str(PIPELINE_PATH),
-        "alt_pipeline_path": str(ALT_PIPELINE_PATH),
         "pipeline_path_exists": PIPELINE_PATH.exists(),
+        "alt_pipeline_path": str(ALT_PIPELINE_PATH),
         "alt_pipeline_path_exists": ALT_PIPELINE_PATH.exists(),
         "model_path_exists": MODEL_PATH.exists(),
         "preproc_path_exists": PREPROC_PATH.exists(),
@@ -468,6 +493,31 @@ def debug_fs():
         except Exception as e:
             listing[p] = ["<ERROR> " + str(e)]
     return jsonify({"cwd": os.getcwd(), "tree": listing})
+
+@app.route("/debug_predict", methods=["POST"])
+def debug_predict():
+    payload = request.get_json(force=True, silent=True) or {}
+    info = {"mode": model_mode, "model_loaded": bool(model_loaded)}
+    try:
+        if model_mode == "xgb_ensemble" and ensemble_bundle and xgb and sp and pd is not None:
+            df = _row_from_payload(payload)
+            raw = []
+            for idx, f in enumerate(ensemble_bundle.get("folds", []), start=1):
+                pre_catnum = f["pre_catnum"]; tfidf_word = f["tfidf_word"]; tfidf_char = f["tfidf_char"]; booster = f["booster"]; best_iter = int(f.get("best_iter", 0))
+                M_cn = pre_catnum.transform(df); M_w = tfidf_word.transform(df["product"]); M_c = tfidf_char.transform(df["product"])
+                Xmat = sp.hstack([M_cn, M_w, M_c], format="csr"); dmat = xgb.DMatrix(Xmat)
+                proba = booster.predict(dmat, iteration_range=(0, best_iter+1))
+                val = float(proba[0])
+                raw.append(val)
+            avg = float(sum(raw)/len(raw)) if raw else None
+            info["raw_fold_preds"] = raw
+            info["avg_raw"] = avg
+        p = _predict_with_model(payload)
+        info["final_probability"] = p
+    except Exception as e:
+        info["error"] = repr(e)
+        info["trace"] = traceback.format_exc()
+    return jsonify(info)
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -518,7 +568,7 @@ def set_preferences():
     PREF_FILE.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
     return jsonify({"status": "success"})
 
-# -------- Premium UI (no f-string — placeholders replaced) --------
+# -------- Premium UI (placeholders replaced safely) --------
 @app.route("/", methods=["GET"])
 def index_page():
     html = """
@@ -546,15 +596,12 @@ def index_page():
   .logo{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--acc),#a2b6ff);box-shadow:0 2px 12px rgba(122,167,255,.6)}
   .chip{padding:6px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px;color:var(--mut);background:var(--glass)}
   .wrap{max-width:1160px;margin:26px auto;padding:0 16px}
-
   .tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
   .tab{cursor:pointer;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--glass);color:var(--ink);font-weight:700;transition:all .2s ease}
   .tab:hover{transform:translateY(-1px)}
   .tab.active{background:linear-gradient(90deg,var(--acc),#99c1ff);color:#0b0c10;border-color:transparent}
-
   .cards{display:grid;grid-template-columns:1.6fr 1fr;gap:16px}
   @media(max-width:1020px){.cards{grid-template-columns:1fr}}
-
   .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow)}
   .section-title{font-size:13px;color:var(--mut);margin:0 0 12px 4px;letter-spacing:.4px;text-transform:uppercase}
   label{display:block;font-size:12px;color:var(--mut);margin:0 0 8px 2px}
@@ -563,32 +610,25 @@ def index_page():
   .grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
   .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
   @media(max-width:860px){.grid-3,.grid-2{grid-template-columns:1fr}}
-
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .btn{cursor:pointer;border:none;border-radius:12px;padding:12px 16px;font-weight:800;transition:transform .06s ease, filter .1s ease}
   .btn:active{transform:translateY(1px)}
   .btn.primary{background:linear-gradient(90deg,var(--acc),#99c1ff);color:#0b0c10}
   .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
-
   .metric{display:flex;gap:14px;align-items:center}
   .kpi{font-size:34px;font-weight:900}
   .desc{color:var(--mut);font-size:12px}
   .gauge{--p:0;position:relative;height:12px;border-radius:999px;background:#0e1115;border:1px solid var(--line);overflow:hidden}
   .gauge>i{position:absolute;inset:0;width:calc(var(--p)*1%);background:linear-gradient(90deg,var(--warn),var(--danger));transition:width .35s ease}
-
   .result{margin-top:12px;padding:14px;border:1px dashed var(--line);border-radius:12px;background:#0f1116;white-space:pre-wrap}
   .mut{color:var(--mut)}
-
   .pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:8px 12px;background:#0f1116;margin:4px 4px 0 0}
   .pill b{font-size:12px}
-
   .miniChart{height:64px;width:100%;border:1px solid var(--line);border-radius:12px;background:#0f1116;position:relative;overflow:hidden}
   .miniChart canvas{position:absolute;inset:0}
-
   .toast{position:fixed;right:16px;bottom:16px;display:none;max-width:320px;background:#10131a;border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
   .toast.show{display:block;animation:pop .18s ease}
   @keyframes pop{from{transform:translateY(6px);opacity:.6}to{transform:none;opacity:1}}
-
   .tip{font-size:12px;line-height:1.6;color:var(--mut)}
 </style>
 </head>
@@ -818,6 +858,7 @@ async function predict(){
 
 function clearResult(){ document.querySelector("#resultPredict").textContent = "결과 대기 중"; setGauge(0); drawSpark(); }
 
+// 저장
 async function saveData(){
   const payload = {
     "금액(원)": Number(document.querySelector("#s_price").value||0),
@@ -849,7 +890,6 @@ async function saveData(){
 </body>
 </html>
     """
-
     # 안전한 플레이스홀더 치환
     html = html.replace("__DATA_FILE_NAME__", DATA_FILE.name)
     html = html.replace("__DATA_FILE_PATH__", DATA_FILE.as_posix())
@@ -859,7 +899,6 @@ async function saveData(){
     return resp
 
 if __name__ == "__main__":
-    # 서버 시작 전에 모델 로드 시도
-    _try_load_models()
+    # 로컬 직접 실행 시에도 로드는 이미 import에서 수행됨.
     port = int(os.environ.get("PORT", 61006))
     app.run(host="0.0.0.0", port=port)
