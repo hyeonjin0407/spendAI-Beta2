@@ -129,6 +129,30 @@ def _extract_proba_one(proba_row) -> float:
 
     return _as_float(proba_row, 0.0)
 
+def _proba_from_estimator(est, X):
+    """
+    est: 최종 추정기 (Pipeline의 마지막 스텝 or 단일 모델)
+    X  : 해당 est가 기대하는 입력(변환 완료된 2D)
+    """
+    # 1) 표준 predict_proba
+    if hasattr(est, "predict_proba"):
+        proba = est.predict_proba(X)
+        row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+        return max(0.0, min(1.0, _extract_proba_one(row)))
+
+    # 2) decision_function → 시그모이드
+    if hasattr(est, "decision_function"):
+        s = est.decision_function(X)
+        if hasattr(s, "ravel"):
+            s = float(s.ravel()[0])
+        else:
+            s = float(s[0] if hasattr(s, "__len__") else s)
+        return max(0.0, min(1.0, _sigmoid(s)))
+
+    # 3) 마지막 수단: predict(0/1)을 float로
+    y = est.predict(X)
+    return max(0.0, min(1.0, _as_float(y[0], 0.0)))
+
 # -------- Heuristic Model --------
 REASONS_IMPULSIVE = {"즉흥 구매", "스트레스 해소용", "온라인 광고 보고"}
 REASONS_PLANNED   = {"필요", "계획된 지출", "기념일 선물로"}
@@ -376,7 +400,6 @@ def _predict_with_ensemble(payload: dict) -> float:
                 best_iter  = _fget(f, "best_iter", None)
 
                 if pre_catnum is None or tfidf_word is None or tfidf_char is None or booster is None:
-                    # 구조가 예상과 다르면 이 폴드는 스킵
                     continue
 
                 # 입력 변환
@@ -386,10 +409,10 @@ def _predict_with_ensemble(payload: dict) -> float:
                 Xmat = sp.hstack([M_cn, M_w, M_c], format="csr")
                 dmat = xgb.DMatrix(Xmat)
 
-                # 1) 전체 트리 예측(항상 가능)
+                # 1) 전체 트리 예측
                 p_full = float(booster.predict(dmat)[0])
 
-                # 2) best_iter 유효하면 최적 반복 예측도 시도 (버전따라 예외 나면 무시)
+                # 2) best_iter 있으면 평균
                 p_best = None
                 try:
                     if isinstance(best_iter, int) and best_iter >= 0:
@@ -397,7 +420,6 @@ def _predict_with_ensemble(payload: dict) -> float:
                 except Exception:
                     p_best = None
 
-                # 사용값: p_best 있으면 평균, 없으면 p_full
                 val = p_full if (p_best is None) else ((p_full + p_best) / 2.0)
 
                 # NaN/범위 방어
@@ -405,7 +427,6 @@ def _predict_with_ensemble(payload: dict) -> float:
                     val = 0.5
                 preds.append(val)
             except Exception:
-                # 개별 폴드 실패는 전체 실패로 보지 않음
                 continue
 
         if not preds:
@@ -429,26 +450,39 @@ def _predict_with_model(payload: dict) -> float:
             # 1) pipeline 모드
             if model_mode == "pipeline" and pipeline is not None:
                 df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
+
+                # 파이프라인의 마지막 추정기/앞단 변환기 분리
+                try:
+                    from sklearn.pipeline import Pipeline as _SkPipe
+                    if isinstance(pipeline, _SkPipe) and len(pipeline.steps) >= 1:
+                        last_est = pipeline.steps[-1][1]
+                        pre = _SkPipe(pipeline.steps[:-1]) if len(pipeline.steps) > 1 else None
+                        X = pre.transform(df) if pre is not None else df
+                        p = _proba_from_estimator(last_est, X)
+                        return max(0.0, min(1.0, p))
+                except Exception:
+                    pass
+
+                # 파이프라인이 아니거나 위가 실패하면 직접 시도
                 if hasattr(pipeline, "predict_proba"):
                     proba = pipeline.predict_proba(df)
-                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
-                    p = _extract_proba_one(proba_row)
-                else:
-                    y = pipeline.predict(df)
-                    p = _as_float(y[0], 0.0)
-                return max(0.0, min(1.0, p))
+                    row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(row)
+                    return max(0.0, min(1.0, p))
+
+                if hasattr(pipeline, "decision_function"):
+                    s = pipeline.decision_function(df)
+                    s = float(s.ravel()[0]) if hasattr(s, "ravel") else float(s[0] if hasattr(s, "__len__") else s)
+                    return max(0.0, min(1.0, _sigmoid(s)))
+
+                y = pipeline.predict(df)
+                return max(0.0, min(1.0, _as_float(y[0], 0.0)))
 
             # 2) model+preproc 모드
             if model_mode == "model+preproc" and model is not None and preproc is not None:
                 df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
                 X = preproc.transform(df)
-                if hasattr(model, "predict_proba"):
-                    proba = model.predict_proba(X)
-                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
-                    p = _extract_proba_one(proba_row)
-                else:
-                    y = model.predict(X)
-                    p = _as_float(y[0], 0.0)
+                p = _proba_from_estimator(model, X)
                 return max(0.0, min(1.0, p))
 
             # 3) model_only (간소화)
@@ -467,13 +501,7 @@ def _predict_with_model(payload: dict) -> float:
                 d = days.get(str(payload.get("요일","") or ""), 0)
                 u = 1 if str(payload.get("user_type","") or "") in {"hobby_spender","electronics_lover"} else (-1 if str(payload.get("user_type","") or "")=="planned_spending" else 0)
                 Xa = np.array([[price, mood, month, c, r, d, u]], dtype=float)
-                if hasattr(model, "predict_proba"):
-                    proba = model.predict_proba(Xa)
-                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
-                    p = _extract_proba_one(proba_row)
-                else:
-                    y = model.predict(Xa)
-                    p = _as_float(y[0], 0.0)
+                p = _proba_from_estimator(model, Xa)
                 return max(0.0, min(1.0, p))
     except Exception as e:
         _log("Predict failed with model: " + repr(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
@@ -845,13 +873,15 @@ async function fetchJSON(path, opts) {
 
 let hist = [];
 
+// ★ 여기 수정: 반올림 제거하고 소수 1자리 유지
 function setGauge(p){
   const g=document.querySelector("#gauge"); const i=document.querySelector("#gauge i");
-  const pct=Math.max(0,Math.min(100,Math.round(p*100)));
-  g.style.setProperty("--p", pct);
-  i.style.width = pct + "%";
-  document.querySelector("#kpiPercent").textContent = pct.toFixed(0)+"%";
-  document.querySelector("#descText").textContent = pct<35 ? "안정적인 지출로 보입니다." : (pct<70 ? "경계 구간입니다." : "후회 가능성이 높아요.");
+  const pctFloat = Math.max(0, Math.min(100, Number(p)*100));
+  g.style.setProperty("--p", pctFloat);
+  i.style.width = pctFloat + "%";
+  document.querySelector("#kpiPercent").textContent = pctFloat.toFixed(1)+"%";
+  document.querySelector("#descText").textContent =
+    pctFloat<35 ? "안정적인 지출로 보입니다." : (pctFloat<70 ? "경계 구간입니다." : "후회 가능성이 높아요.");
 }
 
 function drawSpark(){
