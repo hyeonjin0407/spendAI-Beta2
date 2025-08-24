@@ -5,6 +5,6 @@ numpy==1.26.4
 pandas==2.3.1
 scikit-learn==1.7.1
 joblib==1.4.2
-xgboost==2.0.3
+xgboost==2.1.1    # ← 2.0.3에서 올리기
 scipy==1.11.4
 gdown
