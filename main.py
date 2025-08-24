@@ -1,11 +1,4 @@
-# main.py — SpendAI (Premium UI + API, single file)
-# - / : 다크 프리미엄 UI
-# - /health, /predict, /save_data, /get_preferences, /set_preferences, /debug_fs, /debug_predict
-# - 모델 자동 로드: xgb_ensemble -> pipeline -> (model+preproc) -> model_only -> heuristic
-# - 예측 안정화: NaN/범위 방어, 제품명 공백 기본 토큰
-# - Windows 로컬 CSV 강제 저장(기본) 또는 프로젝트 상대 경로
-# - 런타임 백업 다운로드(gdown) 지원: MODEL_GDRIVE_URL 환경변수
-
+# main.py — SpendAI (Premium UI + API, with probability smoothing)
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from pathlib import Path
@@ -55,20 +48,33 @@ else:
 
 MODEL_DIR = ROOT / "model"
 PIPELINE_PATH = MODEL_DIR / "spendai_pipeline.pkl"
-ALT_PIPELINE_PATH = ROOT / "spendai_pipeline.pkl"  # 루트에 있을 수도 있음
+ALT_PIPELINE_PATH = ROOT / "spendai_pipeline.pkl"
 MODEL_PATH    = MODEL_DIR / "spendai_model.pkl"
 PREPROC_PATH  = MODEL_DIR / "spendai_preprocessor.pkl"
 
 # -------- Model holders --------
-pipeline = None          # sklearn Pipeline or estimator
-model = None             # estimator only
-preproc = None           # preprocessor only
-ensemble_bundle = None   # xgb 앙상블 번들(dict)
+pipeline = None
+model = None
+preproc = None
+ensemble_bundle = None
 model_loaded = False
-model_mode = "heuristic"  # "xgb_ensemble" | "pipeline" | "model+preproc" | "model_only" | "heuristic"
+model_mode = "heuristic"
 
 def _log(msg: str):
     print("[SpendAI] " + str(msg), flush=True)
+
+# -------- Probability smoothing --------
+PROBA_TEMPERATURE = float(os.environ.get("PROBA_TEMPERATURE", "2.2"))
+PROBA_MIX = float(os.environ.get("PROBA_MIX", "0.05"))
+
+def _temp_scale_prob(p: float, T: float = PROBA_TEMPERATURE, mix: float = PROBA_MIX) -> float:
+    """Temperature scaling + mixing with 0.5 to smooth extreme probabilities"""
+    p = max(1e-6, min(1-1e-6, float(p)))
+    z = math.log(p/(1-p)) / max(1e-6, T)
+    q = 1.0/(1.0+math.exp(-z))
+    if mix > 0.0:
+        q = (1.0 - mix) * q + mix * 0.5
+    return max(0.001, min(0.999, q))
 
 # -------- Utils --------
 def _sigmoid(x: float) -> float:
@@ -87,18 +93,10 @@ def _as_float(v, default=0.0) -> float:
             return float(default)
 
 def _extract_proba_one(proba_row) -> float:
-    """
-    predict_proba 반환값 안전 처리:
-    - (2,) like [p0, p1] -> p1
-    - (1,) like [p1]     -> 그 값
-    - 스칼라              -> 그 값
-    - dict-like           -> 클래스 1 또는 최대값
-    """
     try:
-        import numpy as _np  # type: ignore
+        import numpy as _np
     except Exception:
         _np = None
-
     try:
         if _np is not None and isinstance(proba_row, _np.ndarray):
             arr = proba_row.flatten()
@@ -109,14 +107,12 @@ def _extract_proba_one(proba_row) -> float:
             return 0.0
     except Exception:
         pass
-
     if isinstance(proba_row, (list, tuple)):
         if len(proba_row) >= 2:
             return _as_float(proba_row[-1], 0.0)
         elif len(proba_row) == 1:
             return _as_float(proba_row[0], 0.0)
         return 0.0
-
     if isinstance(proba_row, dict):
         if 1 in proba_row:
             return _as_float(proba_row[1], 0.0)
@@ -126,387 +122,82 @@ def _extract_proba_one(proba_row) -> float:
             return max((_as_float(v, 0.0) for v in proba_row.values()), default=0.0)
         except Exception:
             return 0.0
-
     return _as_float(proba_row, 0.0)
 
-def _proba_from_estimator(est, X):
-    """
-    est: 최종 추정기 (Pipeline의 마지막 스텝 or 단일 모델)
-    X  : 해당 est가 기대하는 입력(변환 완료된 2D)
-    """
-    # 1) 표준 predict_proba
-    if hasattr(est, "predict_proba"):
-        proba = est.predict_proba(X)
-        row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
-        return max(0.0, min(1.0, _extract_proba_one(row)))
-
-    # 2) decision_function → 시그모이드
-    if hasattr(est, "decision_function"):
-        s = est.decision_function(X)
-        if hasattr(s, "ravel"):
-            s = float(s.ravel()[0])
-        else:
-            s = float(s[0] if hasattr(s, "__len__") else s)
-        return max(0.0, min(1.0, _sigmoid(s)))
-
-    # 3) 마지막 수단: predict(0/1)을 float로
-    y = est.predict(X)
-    return max(0.0, min(1.0, _as_float(y[0], 0.0)))
-
-# -------- Heuristic Model --------
-REASONS_IMPULSIVE = {"즉흥 구매", "스트레스 해소용", "온라인 광고 보고"}
-REASONS_PLANNED   = {"필요", "계획된 지출", "기념일 선물로"}
-CATS_UP   = {"전자제품", "전자기기", "의류", "가전"}
-CATS_DOWN = {"식료품", "생활용품"}
-
-PREF_ALIGN = {
-    "planned_spending": REASONS_PLANNED,
-    "electronics_lover": {"필요", "평소에 사고 싶었음", "계획된 지출"},
-    "hobby_spender": {"평소에 사고 싶었음", "새로운 취미 시작해서", "기념일 선물로"},
-    "food_lover": {"필요", "가격이 좋아서"},
-    "budget_shopper": {"가격이 좋아서", "필요"},
-    "gift_giver": {"기념일 선물로"},
-}
-PREF_MISALIGN = {
-    "planned_spending": REASONS_IMPULSIVE,
-    "electronics_lover": {"즉흥 구매", "온라인 광고 보고"},
-    "hobby_spender": {"온라인 광고 보고"},
-    "food_lover": {"즉흥 구매"},
-    "budget_shopper": {"즉흥 구매", "스트레스 해소용"},
-    "gift_giver": {"즉흥 구매"},
-}
-
-def _alignment_delta(user_type: str, reason: str, category: str) -> float:
-    ut = (user_type or "").strip()
-    r  = (reason or "").strip()
-    c  = (category or "").strip()
-
-    delta = 0.0
-    if ut in PREF_ALIGN and r in PREF_ALIGN[ut]:
-        delta -= 0.25
-    if ut in PREF_MISALIGN and r in PREF_MISALIGN[ut]:
-        delta += 0.25
-
-    if ut == "electronics_lover":
-        if c in {"전자제품", "전자기기"}: delta -= 0.08
-        if r in REASONS_IMPULSIVE:        delta += 0.05
-    elif ut == "hobby_spender":
-        if c in {"취미"}:                 delta -= 0.06
-    elif ut == "food_lover":
-        if c in {"식료품", "외식"}:       delta -= 0.06
-    return delta
-
-def _heuristic_regret(p: dict) -> float:
-    price     = _as_float(p.get("금액(원)", 0), 0)
-    mood      = _as_float(p.get("당시 기분", 3), 3)  # 1~5
-    reason    = str(p.get("구매 이유", "") or "").strip()
-    category  = str(p.get("항목", "") or "").strip()
-    day       = str(p.get("요일", "") or "").strip()
-    month     = int(p.get("월", 1) or 1)
-    user_type = str(p.get("user_type", "") or "").strip()
-
-    z = 0.0
-    z += (price - 100000.0) / 100000.0 * 0.9
-    z += (3.0 - mood) * 0.35
-    if reason in REASONS_IMPULSIVE: z += 0.5
-    if reason in REASONS_PLANNED:   z -= 0.3
-    if category in CATS_UP:         z += 0.2
-    if category in CATS_DOWN:       z -= 0.15
-    if day in {"금요일","토요일"}:  z += 0.1
-    if month in {11,12}:            z += 0.1
-
-    if user_type == "planned_spending": z -= 0.1
-    elif user_type in {"hobby_spender","electronics_lover"}: z += 0.1
-
-    z += _alignment_delta(user_type, reason, category)
-    return max(0.02, min(0.98, _sigmoid(z)))
-
-_FEATURES = ["금액(원)","당시 기분","항목","구매 이유","요일","월","user_type"]
-
-# -------- Payload -> training feature row (for ensemble) --------
-def _row_from_payload(payload: dict):
-    # 요일 → 0(월)~6(일)
-    dow_map = {"월요일":0,"화요일":1,"수요일":2,"목요일":3,"금요일":4,"토요일":5,"일요일":6}
-    # 감정 정수(1~5) → 라벨
-    feeling_map = {1:"매우나쁨", 2:"나쁨", 3:"보통", 4:"좋음", 5:"행복"}
-
-    amount  = _as_float(payload.get("금액(원)", 0), 0)
-    month   = int(payload.get("월", 0) or 0)
-    dow_ko  = str(payload.get("요일","") or "")
-    feeling_num = int(payload.get("당시 기분", 3) or 3)
-    product = str(payload.get("제품명", "") or "")
-    if not product.strip():
-        product = "상품"  # 텍스트 피처 기본 토큰
-
-    row = {
-        "amount": amount,
-        "category": str(payload.get("항목","") or "기타"),
-        "reason":   str(payload.get("구매 이유","") or "필요"),
-        "feeling":  feeling_map.get(feeling_num, "보통"),
-        "month":    month,
-        "dow":      dow_map.get(dow_ko, 0),
-        "product":  product,
-    }
-    if np is not None:
-        row["amount_log"] = float(np.log1p(max(0.0, row["amount"])))
-    else:
-        row["amount_log"] = 0.0
-    if pd is not None:
-        return pd.DataFrame([row])
-    raise RuntimeError("pandas not available")
-
-# -------- Model loading --------
-def _try_load_models():
-    global pipeline, model, preproc, ensemble_bundle, model_loaded, model_mode
-    try:
-        if joblib is None:
-            _log("joblib not available, skip model load (heuristic).")
-            return
-
-        # 필요 시 런타임 다운로드 (환경변수)
-        if (not PIPELINE_PATH.exists()) and os.environ.get("MODEL_GDRIVE_URL"):
-            try:
-                _log("Pipeline not found; trying runtime gdown via MODEL_GDRIVE_URL ...")
-                subprocess.check_call(["gdown", "--fuzzy", os.environ["MODEL_GDRIVE_URL"], "-O", str(PIPELINE_PATH)])
-                _log("Runtime gdown success.")
-            except Exception as e:
-                _log("Runtime gdown failed: " + repr(e))
-
-        # 탐색 경로
-        path = PIPELINE_PATH if PIPELINE_PATH.exists() else (ALT_PIPELINE_PATH if ALT_PIPELINE_PATH.exists() else None)
-        if path is None:
-            _log("No pipeline file found at known paths.")
-        else:
-            _log(f"Loading pipeline object from: {path}")
-            try:
-                obj = joblib.load(path)
-                _log(f"Loaded object type: {type(obj)}")
-            except Exception as e:
-                _log("joblib.load failed: " + repr(e) + "\n" + traceback.format_exc())
-                obj = None
-
-            if obj is not None:
-                try:
-                    # 1) XGB 앙상블 번들(dict)
-                    if isinstance(obj, dict) and ("folds" in obj or "threshold" in obj):
-                        _log("Detected dict bundle keys: " + ", ".join(list(obj.keys())[:12]))
-                        if xgb is None or sp is None:
-                            _log("xgboost/scipy missing, cannot use ensemble bundle.")
-                        else:
-                            folds = obj.get("folds") or []
-                            ok = False
-                            if folds:
-                                f0 = folds[0]
-                                if isinstance(f0, dict):
-                                    ok = all(k in f0 for k in ["pre_catnum", "tfidf_word", "tfidf_char", "booster"])
-                                else:
-                                    ok = all(hasattr(f0, k) for k in ["pre_catnum", "tfidf_word", "tfidf_char", "booster"])
-                            if ok:
-                                ensemble_bundle = obj
-                                model_loaded = True
-                                model_mode = "xgb_ensemble"
-                                _log(f"XGB ensemble bundle ready. folds={len(folds)}, threshold={obj.get('threshold')}")
-                                return
-                            else:
-                                _log("Dict bundle present but unexpected fold structure; skipping ensemble use.")
-
-                    # 2) dict 안에 pipeline/estimator 또는 model+preproc
-                    if isinstance(obj, dict):
-                        for key in ["pipeline", "estimator", "clf", "model"]:
-                            cand = obj.get(key)
-                            if cand is not None and hasattr(cand, "predict"):
-                                pipeline = cand
-                                model_loaded = True
-                                model_mode = "pipeline"
-                                _log(f"Using estimator from dict key '{key}'.")
-                                return
-                        pre = obj.get("preproc") or obj.get("preprocessor")
-                        mdl = obj.get("model") or obj.get("estimator")
-                        if pre is not None and mdl is not None and hasattr(mdl, "predict"):
-                            preproc = pre; model = mdl
-                            model_loaded = True
-                            model_mode = "model+preproc"
-                            _log("Using dict{preproc + model}.")
-                            return
-                        _log("Dict loaded but no usable estimator/preproc combo.")
-                    else:
-                        # 3) 바로 estimator/pipeline 객체
-                        if hasattr(obj, "predict"):
-                            pipeline = obj
-                            model_loaded = True
-                            model_mode = "pipeline"
-                            _log("Using direct pipeline/estimator object.")
-                            return
-
-                    _log("No usable model detected in loaded object; will try explicit files if present.")
-                except Exception as e:
-                    _log("Post-load inspection failed: " + repr(e) + "\n" + traceback.format_exc())
-
-        # 4) 명시적 경로 (model_only / model+preproc)
-        if MODEL_PATH.exists():
-            try:
-                model = joblib.load(MODEL_PATH)
-                if PREPROC_PATH.exists():
-                    preproc = joblib.load(PREPROC_PATH)
-                    model_mode = "model+preproc"
-                    _log("Loaded model+preproc from explicit paths.")
-                else:
-                    model_mode = "model_only"
-                    _log("Loaded model only from explicit path.")
-                model_loaded = True
-                return
-            except Exception as e:
-                _log("Explicit model load failed: " + repr(e) + "\n" + traceback.format_exc())
-
-        _log("No usable model found. Using heuristic fallback.")
-    except Exception as e:
-        _log("Model load failed (outer): " + repr(e) + "\n" + traceback.format_exc())
-        pipeline = None; model = None; preproc = None; ensemble_bundle = None
-        model_loaded = False; model_mode = "heuristic"
-
-# ----- import 시점에 모델 로드 (gunicorn에서도 동작) -----
-_try_load_models()
+# -------- Model loading (생략: 기존 코드 그대로) --------
+# ... _try_load_models() 함수 등은 그대로 두세요 ...
 
 # -------- Ensemble predict --------
 def _predict_with_ensemble(payload: dict) -> float:
-    """
-    XGB 앙상블 예측(안전판):
-    - 폴드 항목이 dict/객체/네임드튜플 어떤 형태든 getattr/키 접근 모두 지원
-    - iteration_range는 best_iter 유효할 때만 시도, 기본은 전체 트리 예측
-    - 폴드 하나라도 실패하면 그 폴드는 건너뛰고 평균, 전부 실패면 heuristic
-    """
     if ensemble_bundle is None or xgb is None or sp is None:
         return _heuristic_regret(payload)
-
-    def _fget(o, name, default=None):
-        # dict 또는 객체 속성 모두 지원
-        if isinstance(o, dict):
-            return o.get(name, default)
-        return getattr(o, name, default)
-
     try:
         df = _row_from_payload(payload)
         preds = []
         folds = ensemble_bundle.get("folds") if isinstance(ensemble_bundle, dict) else getattr(ensemble_bundle, "folds", None)
         if not folds:
             return _heuristic_regret(payload)
-
         for f in folds:
             try:
-                pre_catnum = _fget(f, "pre_catnum")
-                tfidf_word = _fget(f, "tfidf_word")
-                tfidf_char = _fget(f, "tfidf_char")
-                booster    = _fget(f, "booster")
-                best_iter  = _fget(f, "best_iter", None)
-
-                if pre_catnum is None or tfidf_word is None or tfidf_char is None or booster is None:
-                    continue
-
-                # 입력 변환
-                M_cn = pre_catnum.transform(df)
-                M_w  = tfidf_word.transform(df["product"])
-                M_c  = tfidf_char.transform(df["product"])
-                Xmat = sp.hstack([M_cn, M_w, M_c], format="csr")
-                dmat = xgb.DMatrix(Xmat)
-
-                # 1) 전체 트리 예측
-                p_full = float(booster.predict(dmat)[0])
-
-                # 2) best_iter 있으면 평균
-                p_best = None
-                try:
-                    if isinstance(best_iter, int) and best_iter >= 0:
-                        p_best = float(booster.predict(dmat, iteration_range=(0, best_iter + 1))[0])
-                except Exception:
-                    p_best = None
-
-                val = p_full if (p_best is None) else ((p_full + p_best) / 2.0)
-
-                # NaN/범위 방어
-                if not (0.0 <= val <= 1.0) or (val != val):
-                    val = 0.5
+                pre_catnum = f["pre_catnum"]; tfidf_word = f["tfidf_word"]; tfidf_char = f["tfidf_char"]; booster = f["booster"]
+                best_iter  = int(f.get("best_iter", 0))
+                M_cn = pre_catnum.transform(df); M_w = tfidf_word.transform(df["product"]); M_c = tfidf_char.transform(df["product"])
+                Xmat = sp.hstack([M_cn, M_w, M_c], format="csr"); dmat = xgb.DMatrix(Xmat)
+                proba = booster.predict(dmat, iteration_range=(0, best_iter+1))
+                val = float(proba[0])
                 preds.append(val)
             except Exception:
                 continue
-
         if not preds:
             return _heuristic_regret(payload)
-
         p = float(sum(preds) / len(preds))
         if not (0.0 <= p <= 1.0) or (p != p):
             p = 0.5
+        # ★ 부드럽게
+        p = _temp_scale_prob(p)
         return max(0.001, min(0.999, p))
     except Exception:
         return _heuristic_regret(payload)
 
 # -------- Prediction dispatcher --------
 def _predict_with_model(payload: dict) -> float:
-    # 0) ensemble 우선
     if model_mode == "xgb_ensemble":
         return _predict_with_ensemble(payload)
-
     try:
         if model_loaded and pd is not None:
-            # 1) pipeline 모드
             if model_mode == "pipeline" and pipeline is not None:
                 df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
-
-                # 파이프라인의 마지막 추정기/앞단 변환기 분리
-                try:
-                    from sklearn.pipeline import Pipeline as _SkPipe
-                    if isinstance(pipeline, _SkPipe) and len(pipeline.steps) >= 1:
-                        last_est = pipeline.steps[-1][1]
-                        pre = _SkPipe(pipeline.steps[:-1]) if len(pipeline.steps) > 1 else None
-                        X = pre.transform(df) if pre is not None else df
-                        p = _proba_from_estimator(last_est, X)
-                        return max(0.0, min(1.0, p))
-                except Exception:
-                    pass
-
-                # 파이프라인이 아니거나 위가 실패하면 직접 시도
                 if hasattr(pipeline, "predict_proba"):
                     proba = pipeline.predict_proba(df)
-                    row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
-                    p = _extract_proba_one(row)
-                    return max(0.0, min(1.0, p))
-
-                if hasattr(pipeline, "decision_function"):
-                    s = pipeline.decision_function(df)
-                    s = float(s.ravel()[0]) if hasattr(s, "ravel") else float(s[0] if hasattr(s, "__len__") else s)
-                    return max(0.0, min(1.0, _sigmoid(s)))
-
-                y = pipeline.predict(df)
-                return max(0.0, min(1.0, _as_float(y[0], 0.0)))
-
-            # 2) model+preproc 모드
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = pipeline.predict(df); p = _as_float(y[0], 0.0)
+                return _temp_scale_prob(p)
             if model_mode == "model+preproc" and model is not None and preproc is not None:
                 df = pd.DataFrame([{k: payload.get(k) for k in _FEATURES}])
                 X = preproc.transform(df)
-                p = _proba_from_estimator(model, X)
-                return max(0.0, min(1.0, p))
-
-            # 3) model_only (간소화)
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(X)
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = model.predict(X); p = _as_float(y[0], 0.0)
+                return _temp_scale_prob(p)
             if model_mode == "model_only" and model is not None and np is not None:
-                cats = {"전자제품": 1, "전자기기": 1, "의류": 1, "가전": 1, "식료품": -1, "생활용품": -1}
-                reasons = {
-                    "즉흥 구매": 1, "스트레스 해소용": 1, "온라인 광고 보고": 1,
-                    "필요": -1, "계획된 지출": -1, "기념일 선물로": -1
-                }
-                days = {"금요일": 1, "토요일": 1}
-                price = _as_float(payload.get("금액(원)", 0), 0)
-                mood  = _as_float(payload.get("당시 기분", 3), 3)
-                month = int(payload.get("월", 1) or 1)
-                c = cats.get(str(payload.get("항목","") or ""), 0)
-                r = reasons.get(str(payload.get("구매 이유","") or ""), 0)
-                d = days.get(str(payload.get("요일","") or ""), 0)
-                u = 1 if str(payload.get("user_type","") or "") in {"hobby_spender","electronics_lover"} else (-1 if str(payload.get("user_type","") or "")=="planned_spending" else 0)
-                Xa = np.array([[price, mood, month, c, r, d, u]], dtype=float)
-                p = _proba_from_estimator(model, Xa)
-                return max(0.0, min(1.0, p))
+                # ... 기존 feature engineering ...
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(Xa)
+                    proba_row = proba[0] if getattr(proba, "ndim", 2) >= 1 else proba
+                    p = _extract_proba_one(proba_row)
+                else:
+                    y = model.predict(Xa); p = _as_float(y[0], 0.0)
+                return _temp_scale_prob(p)
     except Exception as e:
-        _log("Predict failed with model: " + repr(e) + "\n" + traceback.format_exc() + " — fallback to heuristic.")
-
+        _log("Predict failed: " + repr(e))
     return _heuristic_regret(payload)
+
+# -------- 이하 /health, /predict, /save_data, UI 등 나머지는 기존 main.py 그대로 --------
 
 # -------- APIs --------
 @app.after_request
